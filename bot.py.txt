@@ -1,0 +1,306 @@
+﻿import asyncio
+import random
+import re
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
+# ВСТАВЬТЕ СВОЙ ТОКЕН ЗДЕСЬ
+TOKEN = "9091290678:AAER0jSXKy4sI-yp9kBb4cl_buDBd_3BBNs"
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+# Хранилище тестов в памяти
+tests = {}
+
+class Quiz(StatesGroup):
+    choosing_mode = State() # Выбор режима
+    answering = State()     # Прохождение теста
+
+
+# ---------- ПАРСЕР ----------
+def parse_test(text: str):
+    blocks = re.split(r'(?i)\*?\*?Вопрос\s*\d+\*?\*?\s*:', text)
+    header = blocks[0]
+    title = "Тест"
+    title_match = re.search(r'(?i)\*?\*?Тема\*?\*?\s*:\s*(.+)', header)
+    if title_match:
+        title = title_match.group(1).strip(' *"\'')
+
+    questions = []
+    for block in blocks[1:]:
+        if not block.strip():
+            continue
+
+        def_match = re.search(r'[«"](.+?)[»"]', block, re.DOTALL)
+        if def_match:
+            definition = def_match.group(1).strip()
+        else:
+            definition = block.split('Варианты')[0].strip(' :«»"\n')
+
+        correct_match = re.search(r'(?i)\*?\*?Правильный ответ\*?\*?\s*:\s*[«"]?(.+?)[»"]?\s*(?:\n|$)', block)
+        if not correct_match:
+            continue
+        correct_text = correct_match.group(1).strip().lower()
+
+        opts_match = re.search(r'(?i)\*?\*?Варианты ответов\*?\*?\s*:\s*(.+?)(?=\*?\*?Правильный ответ|$)', block, re.DOTALL)
+        if not opts_match:
+            continue
+
+        opts_raw = opts_match.group(1).replace('\n', ' ')
+        found_opts = re.findall(r'\d+[\.\)]\s*([^;]+)', opts_raw)
+        if not found_opts:
+            found_opts = [o.strip() for o in opts_raw.split(';') if o.strip()]
+
+        options_clean = [o.strip(' «»"') for o in found_opts]
+
+        correct_idx = 0
+        for i, opt in enumerate(options_clean):
+            if opt.lower() == correct_text:
+                correct_idx = i
+                break
+
+        if len(options_clean) >= 2:
+            questions.append({
+                "def": definition,
+                "options": options_clean,
+                "correct": correct_idx
+            })
+
+    return title, questions
+
+
+# ---------- КЛАВИАТУРЫ ----------
+def get_mode_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Режим 1: Все вопросы", callback_data="mode:1")],
+        [InlineKeyboardButton(text="♾ Режим 2: Бесконечный", callback_data="mode:2")]
+    ])
+
+def options_kb(question, q_index, is_infinite=False, answered=False, chosen_idx=None):
+    order = list(range(len(question["options"])))
+    if not answered:
+        random.shuffle(order)
+
+    buttons = []
+    row = []
+
+    for orig_idx in order:
+        is_correct = (orig_idx == question["correct"])
+
+        if answered:
+            if is_correct:
+                text = f"✅ {question['options'][orig_idx]}"
+            elif orig_idx == chosen_idx:
+                text = f"❌ {question['options'][orig_idx]}"
+            else:
+                text = question['options'][orig_idx]
+            cb_data = "ignore"
+        else:
+            text = question['options'][orig_idx]
+            cb_data = f"ans:{q_index}:{1 if is_correct else 0}:{orig_idx}"
+
+        btn = InlineKeyboardButton(text=text, callback_data=cb_data)
+        row.append(btn)
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+
+    if row:
+        buttons.append(row)
+
+    # Если это бесконечный режим и мы еще не ответили, добавляем кнопку "Закончить"
+    if is_infinite and not answered:
+        buttons.append([InlineKeyboardButton(text="🛑 Закончить тест", callback_data="stop_infinite")])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# ---------- ХЭНДЛЕРЫ ----------
+@dp.message(CommandStart())
+async def start(msg: Message):
+    await msg.answer(
+        "👋 Привет! Пришли мне файл `.txt` с тестом.\n\n"
+        "После загрузки я предложу выбрать режим:\n"
+        "1. **Все вопросы** (по одному разу)\n"
+        "2. **Бесконечный** (пока сам не остановишь)\n\n"
+        "В конце я покажу список твоих ошибок для работы над ними!"
+    )
+
+@dp.message(F.document)
+async def handle_file(msg: Message, state: FSMContext):
+    doc = msg.document
+    if not doc.file_name.lower().endswith(".txt"):
+        await msg.answer("❌ Пожалуйста, сохраните файл как **.txt**")
+        return
+
+    file = await bot.get_file(doc.file_id)
+    content = await bot.download_file(file.file_path)
+
+    try:
+        text = content.read().decode("utf-8")
+    except:
+        text = content.read().decode("cp1251")
+
+    title, questions = parse_test(text)
+    if not questions:
+        await msg.answer("❌ Не удалось найти вопросы. Проверь формат файла.")
+        return
+
+    # Сохраняем сырые вопросы (не перемешиваем пока)
+    tests[msg.from_user.id] = {"title": title, "questions": questions}
+
+    await state.set_state(Quiz.choosing_mode)
+    await msg.answer(
+        f"📚 Тест загружен: *{title}*\n"
+        f"Всего вопросов: {len(questions)}\n\n"
+        f"Выбери режим прохождения:",
+        reply_markup=get_mode_kb(),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data.startswith("mode:"), Quiz.choosing_mode)
+async def choose_mode(cb: CallbackQuery, state: FSMContext):
+    mode = int(cb.data.split(":")[1])
+    user_id = cb.from_user.id
+    questions = tests[user_id]["questions"]
+
+    # Перемешиваем вопросы для случайного порядка
+    shuffled_qs = questions.copy()
+    random.shuffle(shuffled_qs)
+
+    # Сохраняем состояние сессии
+    await state.set_state(Quiz.answering)
+    await state.set_data({
+        "mode": mode,
+        "queue": shuffled_qs,      # Очередь вопросов
+        "current_idx": 0,          # Индекс текущего вопроса в очереди
+        "score": 0,                # Кол-во правильных
+        "total_answered": 0,       # Сколько всего ответили
+        "mistakes": []             # Список ошибок для финала
+    })
+
+    await cb.message.delete() # Удаляем сообщение с выбором режима
+    await send_next_question(cb.message, state)
+
+async def send_next_question(message, state: FSMContext):
+    data = await state.get_data()
+    mode = data["mode"]
+    queue = data["queue"]
+    idx = data["current_idx"]
+
+    # Если вопросы в режиме 1 закончились
+    if mode == 1 and idx >= len(queue):
+        await finish_test(message, state, is_finished_naturally=True)
+        return
+
+    # Если в бесконечном режиме очередь закончилась, перемешиваем заново
+    if mode == 2 and idx >= len(queue):
+        random.shuffle(queue)
+        idx = 0
+        await state.update_data(queue=queue, current_idx=idx)
+
+    q = queue[idx]
+    is_inf = (mode == 2)
+    kb = options_kb(q, idx, is_infinite=is_inf)
+
+    prefix = "♾ *Бесконечный режим*" if is_inf else "📝 *Режим экзамена*"
+    await message.answer(
+        f"{prefix} | Вопрос {idx+1 if not is_inf else ''}\n\n"
+        f"«{q['def']}»",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data.startswith("ans:"), Quiz.answering)
+async def answer(cb: CallbackQuery, state: FSMContext):
+    _, q_idx, is_correct, chosen_idx = cb.data.split(":")
+    q_idx, is_correct, chosen_idx = int(q_idx), int(is_correct), int(chosen_idx)
+
+    data = await state.get_data()
+    mode = data["mode"]
+    queue = data["queue"]
+    q = queue[q_idx]
+
+    # Обновляем статистику
+    new_score = data["score"] + is_correct
+    new_total = data["total_answered"] + 1
+    mistakes = data["mistakes"]
+
+    if not is_correct:
+        mistakes.append({
+            "def": q["def"],
+            "user_ans": q["options"][chosen_idx],
+            "correct_ans": q["options"][q["correct"]]
+        })
+
+    await state.update_data(score=new_score, total_answered=new_total, mistakes=mistakes)
+
+    # Показываем правильный ответ
+    kb_answered = options_kb(q, q_idx, is_infinite=(mode==2), answered=True, chosen_idx=chosen_idx)
+    status = "✅ *Верно!*" if is_correct else "❌ *Неверно.*"
+
+    await cb.message.edit_text(
+        f"«{q['def']}»\n\n{status}",
+        reply_markup=kb_answered,
+        parse_mode="Markdown"
+    )
+    await cb.answer()
+
+    # Пауза 1.5 сек и следующий вопрос
+    await asyncio.sleep(1.5)
+
+    await state.update_data(current_idx=q_idx + 1)
+    await send_next_question(cb.message, state)
+
+@dp.callback_query(F.data == "stop_infinite", Quiz.answering)
+async def stop_infinite(cb: CallbackQuery, state: FSMContext):
+    await cb.message.delete()
+    await finish_test(cb.message, state, is_finished_naturally=False)
+
+@dp.callback_query(F.data == "ignore")
+async def ignore_cb(cb: CallbackQuery):
+    await cb.answer("Вы уже ответили на этот вопрос.")
+
+async def finish_test(message, state: FSMContext, is_finished_naturally=True):
+    data = await state.get_data()
+    score = data["score"]
+    total = data["total_answered"]
+    mistakes = data["mistakes"]
+
+    await state.clear()
+
+    if total == 0:
+        await message.answer("Ты не ответил ни на один вопрос.")
+        return
+
+    pct = round(score / total * 100)
+    text = f"🏁 *Тест завершён!*\n\n"
+    text += f"✅ Правильных: {score} из {total}\n"
+    text += f"📊 Результат: {pct}%\n\n"
+
+    if not mistakes:
+        text += "🎉 *Идеально! Ни одной ошибки.*"
+    else:
+        text += f"📋 *Работа над ошибками ({len(mistakes)}):*\n\n"
+        for i, m in enumerate(mistakes, 1):
+            text += f"*{i}.* {m['def']}\n"
+            text += f"❌ Твой ответ: {m['user_ans']}\n"
+            text += f"✅ Правильно: {m['correct_ans']}\n\n"
+
+    # Telegram ограничивает длину сообщения 4096 символами
+    if len(text) > 4000:
+        for i in range(0, len(text), 4000):
+            await message.answer(text[i:i+4000], parse_mode="Markdown")
+    else:
+        await message.answer(text, parse_mode="Markdown")
+
+async def main():
+    print("Бот запущен...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
